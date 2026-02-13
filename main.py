@@ -1,4 +1,3 @@
-
 from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks
 from fastapi.responses import StreamingResponse, FileResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -19,6 +18,10 @@ from pydantic import BaseModel
 from enum import Enum
 import json
 import aiofiles
+import re
+from pdf2image import convert_from_bytes
+from PIL import Image
+import base64
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -39,7 +42,7 @@ app.add_middleware(
 )
 
 # Configuration
-MAX_PAGES = 30  # Maximum pages allowed in document
+MAX_PAGES = 50  # Maximum pages allowed in document
 FREE_TIER_PAGES = 10  # Pages user can process without limit (can be changed)
 GROQ_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 TEMP_AUDIO_DIR = Path("temp_audio")
@@ -72,7 +75,7 @@ VOICE_DISPLAY_NAMES = {
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 if GROQ_API_KEY:
     groq_client = Groq(api_key=GROQ_API_KEY)
-    logger.info("Groq client initialized for advanced text processing")
+    logger.info("Groq client initialized for vision and text processing")
 else:
     groq_client = None
     logger.warning("Running without Groq - text will not be AI-enhanced")
@@ -87,8 +90,203 @@ class PageProcessRequest(BaseModel):
     page_num: int
 
 
-async def enhance_text_with_groq(text: str, page_num: int) -> str:
-    """Enhance extracted PDF text with Groq LLM for natural, human-like narration"""
+def detect_language(text: str) -> str:
+    """
+    Detect if text is primarily Hindi or English
+    Returns 'hindi' or 'english'
+    """
+    if not text:
+        return 'english'
+    
+    # Count Devanagari characters (Hindi script)
+    hindi_chars = len(re.findall(r'[\u0900-\u097F]', text))
+    # Count English alphabet characters
+    english_chars = len(re.findall(r'[a-zA-Z]', text))
+    
+    # If more than 30% Hindi characters, consider it Hindi
+    total_chars = len(text.replace(' ', '').replace('\n', ''))
+    if total_chars > 0:
+        hindi_ratio = hindi_chars / total_chars
+        if hindi_ratio > 0.3:
+            return 'hindi'
+    
+    # If significantly more Hindi than English
+    if hindi_chars > english_chars:
+        return 'hindi'
+    
+    return 'english'
+
+
+def image_to_base64(image: Image.Image) -> str:
+    """Convert PIL Image to base64 string"""
+    buffered = io.BytesIO()
+    image.save(buffered, format="PNG")
+    img_str = base64.b64encode(buffered.getvalue()).decode()
+    return f"data:image/png;base64,{img_str}"
+
+
+async def extract_text_from_image_with_groq(image: Image.Image, page_num: int) -> tuple:
+    """
+    Extract text from image using Groq Vision API
+    Returns (text, language, confidence)
+    """
+    if not groq_client:
+        return "", "english", 0
+    
+    try:
+        # Convert image to base64
+        image_data_url = image_to_base64(image)
+        
+        # Use Groq Vision API to extract text
+        completion = groq_client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": """Extract ALL text from this image.
+
+CRITICAL - RETURN ONLY THE TEXT:
+- NO introductions like "Here is the text" or "The text reads"
+- NO explanations or commentary
+- NO markdown formatting or code blocks
+- NO line breaks you add yourself
+- NO "Here's the extracted text:" or similar phrases
+- Just the actual text content from the image, nothing else
+
+LANGUAGE:
+- Keep the ORIGINAL language - do NOT translate
+- Hindi text must stay in Hindi (Devanagari script)
+- English text must stay in English
+
+FORMATTING:
+- Preserve paragraph structure from the image
+- Remove headers, footers, page numbers
+- Convert bullet points to flowing sentences
+- Fix obvious typos or broken words
+
+If no readable text: return empty (nothing, not even a message)
+
+Extract now:"""
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": image_data_url
+                            }
+                        }
+                    ]
+                }
+            ],
+            temperature=0.1,  # Very low for consistent extraction
+            max_tokens=4096,
+        )
+        
+        extracted_text = completion.choices[0].message.content.strip()
+        
+        # Clean up any LLM artifacts that might have been added
+        # Remove common prefixes the LLM might add
+        prefixes_to_remove = [
+            "here is the text:",
+            "here's the text:",
+            "the text reads:",
+            "extracted text:",
+            "here is the extracted text:",
+            "here's the extracted text:",
+            "the text from the image:",
+            "text content:",
+            "the content is:",
+            "here you go:",
+            "sure, here's the text:",
+        ]
+        
+        extracted_lower = extracted_text.lower()
+        for prefix in prefixes_to_remove:
+            if extracted_lower.startswith(prefix):
+                # Remove the prefix (case-insensitive)
+                extracted_text = extracted_text[len(prefix):].strip()
+                break
+        
+        # Remove markdown code blocks if present
+        if extracted_text.startswith("```") and extracted_text.endswith("```"):
+            # Remove first and last lines
+            lines = extracted_text.split('\n')
+            if len(lines) > 2:
+                extracted_text = '\n'.join(lines[1:-1]).strip()
+        
+        # Detect language
+        language = detect_language(extracted_text)
+        
+        logger.info(f"Page {page_num}: Vision API extracted text ({language})")
+        
+        # Confidence is high since it's AI extraction, not OCR
+        return extracted_text, language, 95
+        
+    except Exception as e:
+        logger.error(f"Groq Vision API error on page {page_num}: {e}")
+        return "", "english", 0
+
+
+async def process_pdf_page_smart(pdf_bytes: bytes, page_num: int) -> tuple:
+    """
+    Smart PDF page processing:
+    1. Try to extract text directly
+    2. If no text, convert to image and use Groq Vision
+    Returns (text, is_vision, language, confidence)
+    """
+    try:
+        # First, try to extract text normally
+        pdf_file = io.BytesIO(pdf_bytes)
+        pdf_reader = PyPDF2.PdfReader(pdf_file)
+        
+        if page_num >= len(pdf_reader.pages):
+            return "", False, "english", 0
+        
+        page = pdf_reader.pages[page_num]
+        
+        try:
+            extracted_text = page.extract_text()
+        except:
+            extracted_text = ""
+        
+        # If we got meaningful text (more than 50 characters), use it
+        if extracted_text and len(extracted_text.strip()) > 50:
+            language = detect_language(extracted_text)
+            logger.info(f"Page {page_num + 1}: Extracted text directly ({language})")
+            return extracted_text.strip(), False, language, 100
+        
+        # If no text or very little text, use Groq Vision
+        logger.info(f"Page {page_num + 1}: No extractable text, using Vision API...")
+        
+        # Convert PDF page to image
+        images = convert_from_bytes(
+            pdf_bytes,
+            first_page=page_num + 1,
+            last_page=page_num + 1,
+            dpi=200  # Good balance between quality and speed
+        )
+        
+        if not images:
+            return "", False, "english", 0
+        
+        # Use Groq Vision API to extract text from image
+        image = images[0]
+        vision_text, language, confidence = await extract_text_from_image_with_groq(image, page_num + 1)
+        
+        return vision_text, True, language, confidence
+        
+    except Exception as e:
+        logger.error(f"Error processing page {page_num + 1}: {e}")
+        return "", False, "english", 0
+
+
+async def enhance_text_for_audio(text: str, page_num: int, language: str = 'english') -> str:
+    """
+    Enhance extracted text to make it better for audio narration
+    This is DIFFERENT from extraction - this makes it sound better
+    """
     if not groq_client:
         return text
     
@@ -96,68 +294,111 @@ async def enhance_text_with_groq(text: str, page_num: int) -> str:
         return text
     
     try:
+        # Enhancement prompt (NOT extraction)
+        if language == 'hindi':
+            system_prompt = """You are preparing text for audio narration. Make it flow naturally for listening.
+
+CRITICAL - RETURN ONLY THE TEXT:
+- NO introductions like "Here is the polished text" or "Ready for narration"
+- NO explanations or meta-commentary
+- NO phrases like "Here's the enhanced version" or similar
+- Just return the improved text directly, nothing else
+
+Your improvements:
+1. Keep the SAME LANGUAGE (Hindi stays Hindi)
+2. Make sentences flow smoothly
+3. Add natural pauses with commas where appropriate
+4. Expand abbreviations
+5. Make it conversational and engaging
+6. Fix grammar issues
+7. Smooth transitions
+
+Return the text only."""
+        else:
+            system_prompt = """You are preparing text for audio narration. Make it flow naturally for listening.
+
+CRITICAL - RETURN ONLY THE TEXT:
+- NO introductions like "Here is the polished text" or "Ready for narration"
+- NO explanations or meta-commentary
+- NO phrases like "Here's the enhanced version" or similar
+- Just return the improved text directly, nothing else
+
+Your improvements:
+1. Make sentences flow smoothly
+2. Add natural pauses with commas
+3. Expand abbreviations (Dr. → Doctor)
+4. Make it conversational and engaging
+5. Fix grammar issues
+6. Smooth transitions
+
+Return the text only."""
+        
         completion = groq_client.chat.completions.create(
             model=GROQ_MODEL,
             messages=[
                 {
                     "role": "system",
-                    "content": """You are an expert text narrator and editor. Transform the extracted PDF text into natural, flowing narration suitable for text-to-speech.
-
-Your task:
-1. Remove all formatting artifacts, headers, footers, page numbers
-2. Fix broken sentences and paragraphs
-3. Convert bullet points and lists into natural flowing sentences
-4. Smooth out transitions between sections
-5. Make technical content more conversational while keeping accuracy
-6. Add brief natural pauses with commas where appropriate
-7. Expand abbreviations for better listening (e.g., "Dr." to "Doctor")
-8. Convert symbols and special characters to words
-9. Keep the content engaging and easy to follow aurally
-
-Return ONLY the enhanced narration text. Make it sound like a skilled narrator reading to an engaged listener."""
+                    "content": system_prompt
                 },
                 {
                     "role": "user",
-                    "content": f"Transform this text from page {page_num} into natural narration:\n\n{text}"
+                    "content": f"Prepare this text for audio narration (page {page_num}):\n\n{text}"
                 }
             ],
-            temperature=0.4,
+            temperature=0.3,
             max_tokens=4096,
-            top_p=0.95,
-            stream=False
         )
         
-        enhanced_text = completion.choices[0].message.content
-        logger.info(f"Successfully enhanced page {page_num} with Groq")
-        return enhanced_text.strip()
+        enhanced_text = completion.choices[0].message.content.strip()
+        
+        # Clean up any LLM artifacts that might have been added
+        prefixes_to_remove = [
+            "here is the polished text:",
+            "here's the polished text:",
+            "ready for narration:",
+            "polished text:",
+            "enhanced text:",
+            "here is the text:",
+            "here's the text:",
+            "here you go:",
+            "sure, here's the enhanced version:",
+            "here's the enhanced version:",
+        ]
+        
+        enhanced_lower = enhanced_text.lower()
+        for prefix in prefixes_to_remove:
+            if enhanced_lower.startswith(prefix):
+                enhanced_text = enhanced_text[len(prefix):].strip()
+                break
+        
+        # Remove markdown code blocks if present
+        if enhanced_text.startswith("```") and enhanced_text.endswith("```"):
+            lines = enhanced_text.split('\n')
+            if len(lines) > 2:
+                enhanced_text = '\n'.join(lines[1:-1]).strip()
+        
+        # Verify language preservation for Hindi
+        if language == 'hindi':
+            enhanced_lang = detect_language(enhanced_text)
+            if enhanced_lang != 'hindi':
+                logger.warning(f"Page {page_num}: Enhancement changed language, using original")
+                return text
+        
+        logger.info(f"Enhanced page {page_num} for audio ({language})")
+        return enhanced_text
     
     except Exception as e:
-        logger.error(f"Groq enhancement error on page {page_num}: {e}")
+        logger.error(f"Enhancement error on page {page_num}: {e}")
         return text
-
-
-async def generate_audio_stream(text: str, voice: str) -> bytes:
-    """Generate audio using edge-TTS"""
-    try:
-        communicate = edge_tts.Communicate(text=text, voice=voice)
-        audio_data = b""
-        
-        async for chunk in communicate.stream():
-            if chunk["type"] == "audio":
-                audio_data += chunk["data"]
-        
-        return audio_data
-    except Exception as e:
-        logger.error(f"TTS generation error: {e}")
-        raise
 
 
 @app.post("/api/parse-pdf")
 async def parse_pdf(file: UploadFile = File(...)):
     """
     Parse PDF and return page-by-page structured data
-    Enforces page limit - shows all pages but marks which are accessible
-    Never returns error - handles all edge cases gracefully
+    Uses Groq Vision API for image-based pages
+    Supports both text-based and scanned PDFs
+    Works with Hindi and English
     """
     try:
         # Read PDF file
@@ -169,12 +410,10 @@ async def parse_pdf(file: UploadFile = File(...)):
             pdf_reader = PyPDF2.PdfReader(pdf_file)
         except Exception as e:
             logger.warning(f"PDF reader error: {e}, attempting recovery...")
-            # Try with strict mode off
             try:
                 pdf_file.seek(0)
                 pdf_reader = PyPDF2.PdfReader(pdf_file, strict=False)
             except:
-                # Last resort: return empty structure
                 return {
                     "success": True,
                     "page_count": 0,
@@ -194,59 +433,71 @@ async def parse_pdf(file: UploadFile = File(...)):
         accessible_pages = FREE_TIER_PAGES if has_limit else total_pages
         locked_pages = total_pages - accessible_pages if has_limit else 0
         
-        # Extract text page by page
+        # Process pages
         pages = []
+        
+        logger.info(f"Processing PDF: {total_pages} pages")
         
         for page_num in range(total_pages):
             is_accessible = page_num < accessible_pages
             
             try:
-                page = pdf_reader.pages[page_num]
-                raw_text = page.extract_text()
+                # Smart processing: text extraction or vision API
+                extracted_text, is_vision, detected_language, confidence = await process_pdf_page_smart(
+                    pdf_content, page_num
+                )
                 
-                if not raw_text or not raw_text.strip():
-                    # Handle empty pages gracefully
+                if not extracted_text or not extracted_text.strip():
                     pages.append({
                         "page": page_num + 1,
                         "text": f"Page {page_num + 1} contains no readable text.",
                         "has_content": False,
                         "is_accessible": is_accessible,
-                        "is_locked": not is_accessible
+                        "is_locked": not is_accessible,
+                        "language": "english",
+                        "extraction_method": "none",
+                        "confidence": 0
                     })
                     continue
                 
                 # Clean text
-                cleaned_text = raw_text.strip()
+                cleaned_text = extracted_text.strip()
                 
-                # Enhance with Groq if available (process all pages to get quality text)
+                # Enhance for audio (only if Groq available)
                 if groq_client:
-                    enhanced_text = await enhance_text_with_groq(cleaned_text, page_num + 1)
+                    enhanced_text = await enhance_text_for_audio(cleaned_text, page_num + 1, detected_language)
                 else:
                     enhanced_text = cleaned_text
                 
-                # Store full enhanced text for all pages
-                # For locked pages, show preview in 'text' but keep full in 'full_text'
+                # For locked pages, show preview
                 display_text = enhanced_text if is_accessible else enhanced_text[:200] + "... [Locked - Upgrade to access]"
                 
                 pages.append({
                     "page": page_num + 1,
                     "text": display_text,
-                    "full_text": enhanced_text,  # Always store full enhanced text
+                    "full_text": enhanced_text,
                     "has_content": True,
-                    "word_count": len(enhanced_text.split()),  # Real word count from full text
+                    "word_count": len(enhanced_text.split()),
                     "is_accessible": is_accessible,
-                    "is_locked": not is_accessible
+                    "is_locked": not is_accessible,
+                    "language": detected_language,
+                    "extraction_method": "vision" if is_vision else "text",
+                    "confidence": round(confidence, 1)
                 })
                 
+                logger.info(f"Page {page_num + 1}: {'Vision' if is_vision else 'Text'} extraction ({detected_language})")
+                
             except Exception as e:
-                # Handle individual page errors
                 logger.error(f"Error processing page {page_num + 1}: {e}")
                 pages.append({
                     "page": page_num + 1,
                     "text": f"Page {page_num + 1} could not be processed.",
                     "has_content": False,
                     "is_accessible": is_accessible,
-                    "is_locked": not is_accessible
+                    "is_locked": not is_accessible,
+                    "language": "english",
+                    "extraction_method": "error",
+                    "confidence": 0
                 })
         
         if not pages:
@@ -255,10 +506,17 @@ async def parse_pdf(file: UploadFile = File(...)):
                 "text": "No content could be extracted from this document.",
                 "has_content": False,
                 "is_accessible": True,
-                "is_locked": False
+                "is_locked": False,
+                "language": "english",
+                "extraction_method": "none",
+                "confidence": 0
             })
         
-        logger.info(f"Successfully parsed PDF: {total_pages} pages ({accessible_pages} accessible, {locked_pages} locked)")
+        # Calculate statistics
+        vision_pages = sum(1 for p in pages if p.get("extraction_method") == "vision")
+        text_pages = sum(1 for p in pages if p.get("extraction_method") == "text")
+        
+        logger.info(f"Successfully parsed PDF: {total_pages} pages ({vision_pages} vision, {text_pages} text)")
         
         return {
             "success": True,
@@ -269,11 +527,15 @@ async def parse_pdf(file: UploadFile = File(...)):
             "pages": pages,
             "has_limit": has_limit,
             "limit_message": f"Free tier: {FREE_TIER_PAGES} pages. Upgrade to unlock all {page_count} pages!" if has_limit else "",
-            "capped": page_count > MAX_PAGES
+            "capped": page_count > MAX_PAGES,
+            "extraction_stats": {
+                "vision_pages": vision_pages,
+                "text_pages": text_pages,
+                "total_processed": len([p for p in pages if p.get("has_content")])
+            }
         }
         
     except Exception as e:
-        # Ultimate fallback - never return error
         logger.error(f"Critical parse error: {e}")
         return {
             "success": True,
@@ -305,9 +567,7 @@ async def generate_page_audio(
     text: str,
     voice: str = VoiceOption.US_FEMALE_NATURAL.value
 ):
-    """
-    Generate audio for a single page and return as streaming response
-    """
+    """Generate audio for a single page and return as streaming response"""
     try:
         if not text or not text.strip():
             raise HTTPException(status_code=400, detail="No text provided")
@@ -323,7 +583,6 @@ async def generate_page_audio(
         if not audio_data:
             raise HTTPException(status_code=500, detail="Audio generation failed")
         
-        # Return as streaming response
         return StreamingResponse(
             io.BytesIO(audio_data),
             media_type="audio/mpeg",
@@ -346,10 +605,7 @@ async def download_page_audio(
     voice: str = VoiceOption.US_FEMALE_NATURAL.value,
     filename: Optional[str] = None
 ):
-    """
-    Generate and download audio for a single page
-    Returns audio file with proper filename
-    """
+    """Generate and download audio for a single page"""
     try:
         if not text or not text.strip():
             raise HTTPException(status_code=400, detail="No text provided")
@@ -370,10 +626,8 @@ async def download_page_audio(
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             filename = f"page_{page}_{timestamp}"
         
-        # Ensure no extension in filename (we'll add .mp3)
         filename = filename.replace('.mp3', '').replace('.wav', '').replace('.', '_')
         
-        # Return as download
         return StreamingResponse(
             io.BytesIO(audio_data),
             media_type="audio/mpeg",
@@ -395,10 +649,7 @@ async def generate_full_document(
     voice: str = VoiceOption.US_FEMALE_NATURAL.value,
     filename: Optional[str] = None
 ):
-    """
-    Generate audio for entire document with all pages combined
-    Pages processed in queue one by one
-    """
+    """Generate audio for entire document with all pages combined"""
     try:
         if not pages:
             raise HTTPException(status_code=400, detail="No pages provided")
@@ -408,19 +659,18 @@ async def generate_full_document(
         if voice not in valid_voices:
             voice = VoiceOption.US_FEMALE_NATURAL.value
         
-        # Combine all page texts with page announcements
+        # Combine all page texts
         full_text = ""
         for page_data in pages:
             page_num = page_data.get("page", 0)
             text = page_data.get("text", "")
             if text.strip():
-                # Add page announcement for better navigation
                 full_text += f"Page {page_num}. {text} ... "
         
         if not full_text.strip():
             raise HTTPException(status_code=400, detail="No content to convert")
         
-        # Generate audio for full document
+        # Generate audio
         logger.info(f"Generating full document audio with {len(pages)} pages")
         audio_data = await generate_audio_stream(full_text, voice)
         
@@ -432,10 +682,8 @@ async def generate_full_document(
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             filename = f"full_document_{timestamp}"
         
-        # Clean filename
         filename = filename.replace('.mp3', '').replace('.wav', '').replace('.', '_')
         
-        # Return as download
         return StreamingResponse(
             io.BytesIO(audio_data),
             media_type="audio/mpeg",
@@ -451,6 +699,21 @@ async def generate_full_document(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+async def generate_audio_stream(text: str, voice: str) -> bytes:
+    """Generate audio using edge-TTS"""
+    try:
+        communicate = edge_tts.Communicate(text=text, voice=voice)
+        audio_data = b""
+        
+        async for chunk in communicate.stream():
+            if chunk["type"] == "audio":
+                audio_data += chunk["data"]
+        
+        return audio_data
+    except Exception as e:
+        logger.error(f"TTS generation error: {e}")
+        raise
+    
 @app.get("/", response_class=HTMLResponse)
 async def root():
     return """
@@ -1334,7 +1597,7 @@ async def root():
                     <div class="upload-box" id="uploadBox">
                         <div class="upload-icon">📄</div>
                         <h3>Drop your PDF here or click to browse</h3>
-                        <p>Maximum 100 pages • AI-enhanced narration • Multiple voice options</p>
+                        <p>Maximum 50 pages • AI-enhanced narration • Multiple voice options</p>
                         <input type="file" id="fileInput" accept=".pdf" hidden>
                     </div>
                 </div>
