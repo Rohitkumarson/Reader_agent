@@ -1,16 +1,24 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException
-from fastapi.responses import HTMLResponse
+
+from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks
+from fastapi.responses import StreamingResponse, FileResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 import PyPDF2
 import io
 import os
-from typing import List, Dict
+from typing import List, Dict, Optional
 import tempfile
 from pathlib import Path
 from groq import Groq
 from dotenv import load_dotenv
 import logging
+import edge_tts
+import asyncio
+from datetime import datetime
+import uuid
+from pydantic import BaseModel
+from enum import Enum
+import json
+import aiofiles
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -30,26 +38,59 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Mount static files
-# app.mount("/static", StaticFiles(directory="static"), name="static")
-
 # Configuration
-MAX_PAGES = 50
+MAX_PAGES = 30  # Maximum pages allowed in document
+FREE_TIER_PAGES = 10  # Pages user can process without limit (can be changed)
 GROQ_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
+TEMP_AUDIO_DIR = Path("temp_audio")
+TEMP_AUDIO_DIR.mkdir(exist_ok=True)
 
-# Initialize Groq client (optional - for text processing)
+# Voice configurations with natural names
+class VoiceOption(str, Enum):
+    INDIAN_FEMALE_WARM = "hi-IN-SwaraNeural"
+    INDIAN_MALE_CALM = "hi-IN-MadhurNeural"
+    US_FEMALE_NATURAL = "en-US-JennyNeural"
+    US_MALE_PROFESSIONAL = "en-US-GuyNeural"
+    UK_FEMALE_ELEGANT = "en-GB-SoniaNeural"
+    UK_MALE_SOPHISTICATED = "en-GB-RyanNeural"
+    AUSTRALIAN_FEMALE = "en-AU-NatashaNeural"
+    CANADIAN_FEMALE = "en-CA-ClaraNeural"
+
+# Voice display names for frontend
+VOICE_DISPLAY_NAMES = {
+    VoiceOption.INDIAN_FEMALE_WARM: "Indian Female (Warm & Clear)",
+    VoiceOption.INDIAN_MALE_CALM: "Indian Male (Calm & Steady)",
+    VoiceOption.US_FEMALE_NATURAL: "US Female (Natural & Friendly)",
+    VoiceOption.US_MALE_PROFESSIONAL: "US Male (Professional & Clear)",
+    VoiceOption.UK_FEMALE_ELEGANT: "UK Female (Elegant & Refined)",
+    VoiceOption.UK_MALE_SOPHISTICATED: "UK Male (Sophisticated & Deep)",
+    VoiceOption.AUSTRALIAN_FEMALE: "Australian Female (Bright & Energetic)",
+    VoiceOption.CANADIAN_FEMALE: "Canadian Female (Smooth & Articulate)",
+}
+
+# Initialize Groq client
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 if GROQ_API_KEY:
     groq_client = Groq(api_key=GROQ_API_KEY)
-    logger.info("Groq client initialized for text processing")
+    logger.info("Groq client initialized for advanced text processing")
 else:
     groq_client = None
-    logger.info("Running without Groq - text will not be AI-processed")
+    logger.warning("Running without Groq - text will not be AI-enhanced")
 
-def process_text_with_groq(text: str, page_num: int) -> str:
-    """Process extracted PDF text with Groq LLM to clean and structure it"""
+# Processing queue
+processing_queue = asyncio.Queue()
+active_jobs = {}
+
+
+class PageProcessRequest(BaseModel):
+    text: str
+    page_num: int
+
+
+async def enhance_text_with_groq(text: str, page_num: int) -> str:
+    """Enhance extracted PDF text with Groq LLM for natural, human-like narration"""
     if not groq_client:
-        return text  # Return original if Groq not available
+        return text
     
     if not text or not text.strip():
         return text
@@ -60,101 +101,354 @@ def process_text_with_groq(text: str, page_num: int) -> str:
             messages=[
                 {
                     "role": "system",
-                    "content": "You are a text processing assistant. Clean up and structure the extracted PDF text to make it more readable and suitable for text-to-speech conversion. Remove formatting artifacts, fix broken sentences, and ensure smooth flow. Keep all important content but make it natural for listening. Return ONLY the cleaned text without any commentary."
+                    "content": """You are an expert text narrator and editor. Transform the extracted PDF text into natural, flowing narration suitable for text-to-speech.
+
+Your task:
+1. Remove all formatting artifacts, headers, footers, page numbers
+2. Fix broken sentences and paragraphs
+3. Convert bullet points and lists into natural flowing sentences
+4. Smooth out transitions between sections
+5. Make technical content more conversational while keeping accuracy
+6. Add brief natural pauses with commas where appropriate
+7. Expand abbreviations for better listening (e.g., "Dr." to "Doctor")
+8. Convert symbols and special characters to words
+9. Keep the content engaging and easy to follow aurally
+
+Return ONLY the enhanced narration text. Make it sound like a skilled narrator reading to an engaged listener."""
                 },
                 {
                     "role": "user",
-                    "content": f"Clean this text from page {page_num}:\n\n{text}"
+                    "content": f"Transform this text from page {page_num} into natural narration:\n\n{text}"
                 }
             ],
-            temperature=0.3,
-            max_completion_tokens=2048,
-            top_p=1,
+            temperature=0.4,
+            max_tokens=4096,
+            top_p=0.95,
             stream=False
         )
         
-        processed_text = completion.choices[0].message.content
-        logger.info(f"Successfully processed page {page_num} with Groq")
-        return processed_text.strip()
+        enhanced_text = completion.choices[0].message.content
+        logger.info(f"Successfully enhanced page {page_num} with Groq")
+        return enhanced_text.strip()
     
     except Exception as e:
-        logger.error(f"Groq processing error on page {page_num}: {e}")
-        return text  # Fallback to original text
+        logger.error(f"Groq enhancement error on page {page_num}: {e}")
+        return text
+
+
+async def generate_audio_stream(text: str, voice: str) -> bytes:
+    """Generate audio using edge-TTS"""
+    try:
+        communicate = edge_tts.Communicate(text=text, voice=voice)
+        audio_data = b""
+        
+        async for chunk in communicate.stream():
+            if chunk["type"] == "audio":
+                audio_data += chunk["data"]
+        
+        return audio_data
+    except Exception as e:
+        logger.error(f"TTS generation error: {e}")
+        raise
+
 
 @app.post("/api/parse-pdf")
 async def parse_pdf(file: UploadFile = File(...)):
     """
-    Parse PDF and return all text line by line
-    Frontend will use browser's Speech Synthesis API to speak
+    Parse PDF and return page-by-page structured data
+    Enforces page limit - shows all pages but marks which are accessible
+    Never returns error - handles all edge cases gracefully
     """
     try:
         # Read PDF file
         pdf_content = await file.read()
         pdf_file = io.BytesIO(pdf_content)
         
-        # Create PDF reader
-        pdf_reader = PyPDF2.PdfReader(pdf_file)
+        # Create PDF reader with error handling
+        try:
+            pdf_reader = PyPDF2.PdfReader(pdf_file)
+        except Exception as e:
+            logger.warning(f"PDF reader error: {e}, attempting recovery...")
+            # Try with strict mode off
+            try:
+                pdf_file.seek(0)
+                pdf_reader = PyPDF2.PdfReader(pdf_file, strict=False)
+            except:
+                # Last resort: return empty structure
+                return {
+                    "success": True,
+                    "page_count": 0,
+                    "total_pages": 0,
+                    "pages": [],
+                    "message": "PDF could not be parsed, but file was received",
+                    "has_limit": False
+                }
+        
         page_count = len(pdf_reader.pages)
         
-        # Check page limit
-        if page_count > MAX_PAGES:
-            raise HTTPException(
-                status_code=400, 
-                detail=f"PDF has {page_count} pages. Maximum allowed is {MAX_PAGES} pages."
-            )
+        # Cap total pages to maximum
+        total_pages = min(page_count, MAX_PAGES)
         
-        # Extract all text line by line
-        all_lines = []
+        # Check if exceeds free tier limit
+        has_limit = page_count > FREE_TIER_PAGES
+        accessible_pages = FREE_TIER_PAGES if has_limit else total_pages
+        locked_pages = total_pages - accessible_pages if has_limit else 0
         
-        for page_num in range(page_count):
-            page = pdf_reader.pages[page_num]
-            raw_text = page.extract_text().strip()
+        # Extract text page by page
+        pages = []
+        
+        for page_num in range(total_pages):
+            is_accessible = page_num < accessible_pages
             
-            if raw_text:
-                # Process with Groq if available
-                processed_text = process_text_with_groq(raw_text, page_num + 1)
+            try:
+                page = pdf_reader.pages[page_num]
+                raw_text = page.extract_text()
                 
-                # Split into sentences for better speech
-                # Split by periods, exclamation marks, and question marks
-                sentences = []
-                current_sentence = ""
+                if not raw_text or not raw_text.strip():
+                    # Handle empty pages gracefully
+                    pages.append({
+                        "page": page_num + 1,
+                        "text": f"Page {page_num + 1} contains no readable text.",
+                        "has_content": False,
+                        "is_accessible": is_accessible,
+                        "is_locked": not is_accessible
+                    })
+                    continue
                 
-                for char in processed_text:
-                    current_sentence += char
-                    if char in '.!?' and len(current_sentence.strip()) > 5:
-                        sentences.append(current_sentence.strip())
-                        current_sentence = ""
+                # Clean text
+                cleaned_text = raw_text.strip()
                 
-                # Add remaining text
-                if current_sentence.strip():
-                    sentences.append(current_sentence.strip())
+                # Enhance with Groq if available (process all pages to get quality text)
+                if groq_client:
+                    enhanced_text = await enhance_text_with_groq(cleaned_text, page_num + 1)
+                else:
+                    enhanced_text = cleaned_text
                 
-                # Add to all lines
-                for sentence in sentences:
-                    if sentence:  # Only add non-empty sentences
-                        all_lines.append({
-                            "page": page_num + 1,
-                            "text": sentence
-                        })
+                # Store full enhanced text for all pages
+                # For locked pages, show preview in 'text' but keep full in 'full_text'
+                display_text = enhanced_text if is_accessible else enhanced_text[:200] + "... [Locked - Upgrade to access]"
+                
+                pages.append({
+                    "page": page_num + 1,
+                    "text": display_text,
+                    "full_text": enhanced_text,  # Always store full enhanced text
+                    "has_content": True,
+                    "word_count": len(enhanced_text.split()),  # Real word count from full text
+                    "is_accessible": is_accessible,
+                    "is_locked": not is_accessible
+                })
+                
+            except Exception as e:
+                # Handle individual page errors
+                logger.error(f"Error processing page {page_num + 1}: {e}")
+                pages.append({
+                    "page": page_num + 1,
+                    "text": f"Page {page_num + 1} could not be processed.",
+                    "has_content": False,
+                    "is_accessible": is_accessible,
+                    "is_locked": not is_accessible
+                })
         
-        if not all_lines:
-            raise HTTPException(status_code=400, detail="No text found in PDF")
+        if not pages:
+            pages.append({
+                "page": 1,
+                "text": "No content could be extracted from this document.",
+                "has_content": False,
+                "is_accessible": True,
+                "is_locked": False
+            })
         
-        logger.info(f"Successfully parsed PDF: {page_count} pages, {len(all_lines)} lines")
+        logger.info(f"Successfully parsed PDF: {total_pages} pages ({accessible_pages} accessible, {locked_pages} locked)")
         
         return {
             "success": True,
-            "page_count": page_count,
-            "line_count": len(all_lines),
-            "lines": all_lines
+            "page_count": total_pages,
+            "total_pages": page_count,
+            "accessible_pages": accessible_pages,
+            "locked_pages": locked_pages,
+            "pages": pages,
+            "has_limit": has_limit,
+            "limit_message": f"Free tier: {FREE_TIER_PAGES} pages. Upgrade to unlock all {page_count} pages!" if has_limit else "",
+            "capped": page_count > MAX_PAGES
         }
         
-    except PyPDF2.errors.PdfReadError:
-        raise HTTPException(status_code=400, detail="Invalid PDF file")
     except Exception as e:
-        logger.error(f"Parse PDF error: {e}")
+        # Ultimate fallback - never return error
+        logger.error(f"Critical parse error: {e}")
+        return {
+            "success": True,
+            "page_count": 0,
+            "pages": [{
+                "page": 1,
+                "text": "An unexpected error occurred during processing, but your file was received.",
+                "has_content": False
+            }],
+            "message": "File received but could not be fully processed"
+        }
+
+
+@app.get("/api/voices")
+async def get_voices():
+    """Get available voice options"""
+    voices = []
+    for voice_key, display_name in VOICE_DISPLAY_NAMES.items():
+        voices.append({
+            "id": voice_key.value,
+            "name": display_name
+        })
+    return {"voices": voices}
+
+
+@app.post("/api/generate-page-audio")
+async def generate_page_audio(
+    page: int,
+    text: str,
+    voice: str = VoiceOption.US_FEMALE_NATURAL.value
+):
+    """
+    Generate audio for a single page and return as streaming response
+    """
+    try:
+        if not text or not text.strip():
+            raise HTTPException(status_code=400, detail="No text provided")
+        
+        # Validate voice
+        valid_voices = [v.value for v in VoiceOption]
+        if voice not in valid_voices:
+            voice = VoiceOption.US_FEMALE_NATURAL.value
+        
+        # Generate audio
+        audio_data = await generate_audio_stream(text, voice)
+        
+        if not audio_data:
+            raise HTTPException(status_code=500, detail="Audio generation failed")
+        
+        # Return as streaming response
+        return StreamingResponse(
+            io.BytesIO(audio_data),
+            media_type="audio/mpeg",
+            headers={
+                "Content-Disposition": f"inline; filename=page_{page}.mp3"
+            }
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error generating audio for page {page}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+
+@app.post("/api/download-page-audio")
+async def download_page_audio(
+    page: int,
+    text: str,
+    voice: str = VoiceOption.US_FEMALE_NATURAL.value,
+    filename: Optional[str] = None
+):
+    """
+    Generate and download audio for a single page
+    Returns audio file with proper filename
+    """
+    try:
+        if not text or not text.strip():
+            raise HTTPException(status_code=400, detail="No text provided")
+        
+        # Validate voice
+        valid_voices = [v.value for v in VoiceOption]
+        if voice not in valid_voices:
+            voice = VoiceOption.US_FEMALE_NATURAL.value
+        
+        # Generate audio
+        audio_data = await generate_audio_stream(text, voice)
+        
+        if not audio_data:
+            raise HTTPException(status_code=500, detail="Audio generation failed")
+        
+        # Generate filename
+        if not filename:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"page_{page}_{timestamp}"
+        
+        # Ensure no extension in filename (we'll add .mp3)
+        filename = filename.replace('.mp3', '').replace('.wav', '').replace('.', '_')
+        
+        # Return as download
+        return StreamingResponse(
+            io.BytesIO(audio_data),
+            media_type="audio/mpeg",
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}.mp3"'
+            }
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error downloading audio for page {page}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/generate-full-document")
+async def generate_full_document(
+    pages: List[Dict],
+    voice: str = VoiceOption.US_FEMALE_NATURAL.value,
+    filename: Optional[str] = None
+):
+    """
+    Generate audio for entire document with all pages combined
+    Pages processed in queue one by one
+    """
+    try:
+        if not pages:
+            raise HTTPException(status_code=400, detail="No pages provided")
+        
+        # Validate voice
+        valid_voices = [v.value for v in VoiceOption]
+        if voice not in valid_voices:
+            voice = VoiceOption.US_FEMALE_NATURAL.value
+        
+        # Combine all page texts with page announcements
+        full_text = ""
+        for page_data in pages:
+            page_num = page_data.get("page", 0)
+            text = page_data.get("text", "")
+            if text.strip():
+                # Add page announcement for better navigation
+                full_text += f"Page {page_num}. {text} ... "
+        
+        if not full_text.strip():
+            raise HTTPException(status_code=400, detail="No content to convert")
+        
+        # Generate audio for full document
+        logger.info(f"Generating full document audio with {len(pages)} pages")
+        audio_data = await generate_audio_stream(full_text, voice)
+        
+        if not audio_data:
+            raise HTTPException(status_code=500, detail="Audio generation failed")
+        
+        # Generate filename
+        if not filename:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"full_document_{timestamp}"
+        
+        # Clean filename
+        filename = filename.replace('.mp3', '').replace('.wav', '').replace('.', '_')
+        
+        # Return as download
+        return StreamingResponse(
+            io.BytesIO(audio_data),
+            media_type="audio/mpeg",
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}.mp3"'
+            }
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error generating full document: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -165,7 +459,8 @@ async def root():
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>PDF to Speech - Browser Edition</title>
+    <title>PDF to Speech Pro - AI Enhanced Voice Generation</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
     <style>
         * {
             margin: 0;
@@ -173,137 +468,456 @@ async def root():
             box-sizing: border-box;
         }
 
+        :root {
+            --primary: #6366f1;
+            --primary-dark: #4f46e5;
+            --secondary: #8b5cf6;
+            --success: #10b981;
+            --warning: #f59e0b;
+            --danger: #ef4444;
+            --dark: #1f2937;
+            --light: #f9fafb;
+            --border: #e5e7eb;
+        }
+
         body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 50%, #f093fb 100%);
             min-height: 100vh;
-            display: flex;
-            align-items: center;
-            justify-content: center;
             padding: 20px;
+            background-attachment: fixed;
         }
 
         .container {
-            background: white;
-            border-radius: 20px;
-            padding: 40px;
-            max-width: 700px;
-            width: 100%;
-            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+
+        .glass {
+            background: rgba(255, 255, 255, 0.95);
+            backdrop-filter: blur(20px);
+            border-radius: 24px;
+            border: 1px solid rgba(255, 255, 255, 0.3);
+            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.25);
         }
 
         header {
             text-align: center;
-            margin-bottom: 30px;
+            padding: 40px;
+            background: linear-gradient(135deg, rgba(99, 102, 241, 0.1) 0%, rgba(139, 92, 246, 0.1) 100%);
+            border-radius: 24px 24px 0 0;
+            border-bottom: 2px solid rgba(99, 102, 241, 0.1);
         }
 
         header h1 {
-            color: #333;
-            font-size: 2em;
-            margin-bottom: 10px;
+            font-size: 3em;
+            font-weight: 800;
+            background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 50%, #ec4899 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            margin-bottom: 12px;
+            letter-spacing: -1px;
         }
 
         header p {
-            color: #666;
-            font-size: 0.95em;
+            color: #6b7280;
+            font-size: 1.2em;
+            font-weight: 500;
+            margin-bottom: 20px;
         }
 
-        .browser-badge {
-            display: inline-block;
-            background: linear-gradient(135deg, #3b82f6 0%, #1d4ed8 100%);
-            color: white;
-            padding: 8px 16px;
-            border-radius: 20px;
-            font-size: 0.85em;
+        .badge-container {
+            display: flex;
+            gap: 12px;
+            justify-content: center;
+            flex-wrap: wrap;
+        }
+
+        .badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 10px 20px;
+            border-radius: 50px;
+            font-size: 0.9em;
             font-weight: 600;
-            margin-top: 10px;
-            box-shadow: 0 4px 12px rgba(59, 130, 246, 0.3);
+            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.1);
+        }
+
+        .badge-primary {
+            background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%);
+            color: white;
+        }
+
+        .badge-success {
+            background: linear-gradient(135deg, #10b981 0%, #059669 100%);
+            color: white;
+        }
+
+        .main-content {
+            padding: 40px;
         }
 
         .upload-section {
-            margin-bottom: 30px;
+            margin-bottom: 40px;
         }
 
         .upload-box {
-            border: 3px dashed #667eea;
-            border-radius: 15px;
-            padding: 50px 20px;
+            border: 3px dashed var(--primary);
+            border-radius: 20px;
+            padding: 80px 40px;
             text-align: center;
             cursor: pointer;
-            transition: all 0.3s ease;
-            background: #f8f9ff;
+            transition: all 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+            background: linear-gradient(135deg, rgba(99, 102, 241, 0.03) 0%, rgba(139, 92, 246, 0.03) 100%);
+            position: relative;
+            overflow: hidden;
+        }
+
+        .upload-box::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: -100%;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(90deg, transparent, rgba(99, 102, 241, 0.1), transparent);
+            transition: left 0.5s;
+        }
+
+        .upload-box:hover::before {
+            left: 100%;
         }
 
         .upload-box:hover {
-            border-color: #764ba2;
-            background: #f0f1ff;
-            transform: translateY(-2px);
+            border-color: var(--secondary);
+            background: linear-gradient(135deg, rgba(99, 102, 241, 0.08) 0%, rgba(139, 92, 246, 0.08) 100%);
+            transform: translateY(-4px);
+            box-shadow: 0 12px 40px rgba(99, 102, 241, 0.2);
         }
 
         .upload-box.dragover {
-            border-color: #764ba2;
-            background: #e8e9ff;
+            border-color: var(--success);
+            background: linear-gradient(135deg, rgba(16, 185, 129, 0.1) 0%, rgba(5, 150, 105, 0.1) 100%);
             transform: scale(1.02);
         }
 
         .upload-icon {
-            width: 60px;
-            height: 60px;
-            color: #667eea;
+            font-size: 5em;
+            margin-bottom: 20px;
+            animation: float 3s ease-in-out infinite;
+        }
+
+        @keyframes float {
+            0%, 100% { transform: translateY(0px); }
+            50% { transform: translateY(-10px); }
+        }
+
+        .upload-box h3 {
+            font-size: 1.5em;
+            color: var(--dark);
+            margin-bottom: 10px;
+            font-weight: 700;
+        }
+
+        .upload-box p {
+            color: #6b7280;
+            font-size: 1.1em;
+        }
+
+        .processing-status {
+            margin-top: 30px;
+            padding: 30px;
+            background: linear-gradient(135deg, #f0f9ff 0%, #e0f2fe 100%);
+            border-radius: 16px;
+            border-left: 5px solid var(--primary);
+            display: none;
+        }
+
+        .processing-status.active {
+            display: block;
+            animation: slideIn 0.5s ease;
+        }
+
+        @keyframes slideIn {
+            from {
+                opacity: 0;
+                transform: translateY(-20px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .status-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+        }
+
+        .status-header h3 {
+            font-size: 1.3em;
+            color: var(--primary-dark);
+            font-weight: 700;
+        }
+
+        .overall-progress {
+            margin: 20px 0;
+        }
+
+        .progress-bar-container {
+            height: 12px;
+            background: rgba(99, 102, 241, 0.1);
+            border-radius: 10px;
+            overflow: hidden;
+            position: relative;
+        }
+
+        .progress-bar-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #6366f1 0%, #8b5cf6 50%, #ec4899 100%);
+            border-radius: 10px;
+            transition: width 0.3s ease;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .progress-bar-fill::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.3), transparent);
+            animation: shimmer 2s infinite;
+        }
+
+        @keyframes shimmer {
+            0% { transform: translateX(-100%); }
+            100% { transform: translateX(100%); }
+        }
+
+        .progress-text {
+            margin-top: 10px;
+            display: flex;
+            justify-content: space-between;
+            font-size: 0.95em;
+            color: #6b7280;
+            font-weight: 600;
+        }
+
+        .pages-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(350px, 1fr));
+            gap: 20px;
+            margin-top: 30px;
+        }
+
+        .page-item {
+            background: white;
+            border: 2px solid var(--border);
+            border-radius: 16px;
+            padding: 20px;
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            position: relative;
+            overflow: hidden;
+        }
+
+        .page-item::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 4px;
+            height: 100%;
+            background: linear-gradient(180deg, #6366f1 0%, #8b5cf6 100%);
+            transform: scaleY(0);
+            transition: transform 0.3s ease;
+        }
+
+        .page-item:hover {
+            border-color: var(--primary);
+            box-shadow: 0 8px 30px rgba(99, 102, 241, 0.15);
+            transform: translateY(-4px);
+        }
+
+        .page-item:hover::before {
+            transform: scaleY(1);
+        }
+
+        .page-item.processing {
+            border-color: var(--warning);
+            background: linear-gradient(135deg, rgba(245, 158, 11, 0.05) 0%, rgba(251, 191, 36, 0.05) 100%);
+        }
+
+        .page-item.completed {
+            border-color: var(--success);
+            background: linear-gradient(135deg, rgba(16, 185, 129, 0.05) 0%, rgba(5, 150, 105, 0.05) 100%);
+        }
+
+        .page-item.error {
+            border-color: var(--danger);
+            background: linear-gradient(135deg, rgba(239, 68, 68, 0.05) 0%, rgba(220, 38, 38, 0.05) 100%);
+        }
+
+        .page-item.locked {
+            border-color: #9ca3af;
+            background: linear-gradient(135deg, rgba(156, 163, 175, 0.05) 0%, rgba(107, 114, 128, 0.05) 100%);
+            opacity: 0.7;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .page-item.locked::after {
+            content: '🔒';
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            font-size: 4em;
+            opacity: 0.1;
+        }
+
+        .page-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
             margin-bottom: 15px;
         }
 
-        .file-info {
-            margin-top: 20px;
-            padding: 15px;
-            background: #f0f9ff;
-            border-radius: 10px;
-            border-left: 4px solid #667eea;
+        .page-number {
+            font-size: 1.2em;
+            font-weight: 700;
+            color: var(--primary);
+            display: flex;
+            align-items: center;
+            gap: 10px;
         }
 
-        .error-message, .success-message {
-            padding: 15px;
-            border-radius: 10px;
-            margin-bottom: 20px;
-            border-left: 4px solid;
+        .page-status-badge {
+            padding: 6px 14px;
+            border-radius: 20px;
+            font-size: 0.8em;
+            font-weight: 600;
+            display: flex;
+            align-items: center;
+            gap: 6px;
         }
 
-        .error-message {
-            background: #fee;
-            color: #c33;
-            border-color: #c33;
+        .status-pending {
+            background: #f3f4f6;
+            color: #6b7280;
         }
 
-        .success-message {
-            background: #efe;
-            color: #3c3;
-            border-color: #3c3;
+        .status-processing {
+            background: #fef3c7;
+            color: #d97706;
         }
 
-        .controls {
-            margin: 30px 0;
+        .status-completed {
+            background: #d1fae5;
+            color: #059669;
+        }
+
+        .status-error {
+            background: #fee2e2;
+            color: #dc2626;
+        }
+
+        .status-locked {
+            background: #fff7ed;
+            color: #ea580c;
+            border: 2px solid #fed7aa;
+        }
+
+        .status-incomplete {
+            background: #fef3c7;
+            color: #d97706;
+        }
+
+        .page-item.locked {
+            border-color: #fed7aa;
+            background: linear-gradient(135deg, rgba(254, 215, 170, 0.05) 0%, rgba(253, 186, 116, 0.05) 100%);
+            opacity: 0.85;
+        }
+
+        .page-item.locked:hover {
+            opacity: 1;
+            border-color: #fb923c;
+            cursor: pointer;
+        }
+
+        .page-preview {
+            color: #4b5563;
+            font-size: 0.9em;
+            line-height: 1.6;
+            max-height: 80px;
+            overflow: hidden;
+            margin-bottom: 15px;
+            display: -webkit-box;
+            -webkit-line-clamp: 3;
+            -webkit-box-orient: vertical;
+        }
+
+        .page-meta {
+            display: flex;
+            gap: 20px;
+            margin-bottom: 15px;
+            font-size: 0.85em;
+            color: #6b7280;
+        }
+
+        .meta-item {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .page-actions {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
         }
 
         .btn {
-            width: 100%;
-            padding: 15px 25px;
+            padding: 10px 20px;
             border: none;
             border-radius: 10px;
-            font-size: 1em;
+            font-size: 0.9em;
             font-weight: 600;
             cursor: pointer;
-            transition: all 0.3s ease;
-            display: flex;
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            display: inline-flex;
             align-items: center;
-            justify-content: center;
-            gap: 10px;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
+            gap: 8px;
+            position: relative;
+            overflow: hidden;
         }
 
-        .btn:hover:not(:disabled) {
-            transform: translateY(-2px);
-            box-shadow: 0 10px 25px rgba(102, 126, 234, 0.4);
+        .btn::before {
+            content: '';
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            width: 0;
+            height: 0;
+            border-radius: 50%;
+            background: rgba(255, 255, 255, 0.3);
+            transform: translate(-50%, -50%);
+            transition: width 0.5s, height 0.5s;
+        }
+
+        .btn:hover::before {
+            width: 300px;
+            height: 300px;
+        }
+
+        .btn:active {
+            transform: scale(0.95);
         }
 
         .btn:disabled {
@@ -311,96 +925,278 @@ async def root():
             cursor: not-allowed;
         }
 
-        .player {
-            background: #f8f9ff;
-            padding: 25px;
-            border-radius: 15px;
-            margin-top: 30px;
+        .btn-primary {
+            background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%);
+            color: white;
+            box-shadow: 0 4px 15px rgba(99, 102, 241, 0.3);
         }
 
-        .player-controls {
+        .btn-primary:hover:not(:disabled) {
+            box-shadow: 0 6px 25px rgba(99, 102, 241, 0.4);
+            transform: translateY(-2px);
+        }
+
+        .btn-success {
+            background: linear-gradient(135deg, #10b981 0%, #059669 100%);
+            color: white;
+            box-shadow: 0 4px 15px rgba(16, 185, 129, 0.3);
+        }
+
+        .btn-success:hover:not(:disabled) {
+            box-shadow: 0 6px 25px rgba(16, 185, 129, 0.4);
+            transform: translateY(-2px);
+        }
+
+        .btn-download {
+            background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%);
+            color: white;
+            box-shadow: 0 4px 15px rgba(245, 158, 11, 0.3);
+        }
+
+        .btn-download:hover:not(:disabled) {
+            box-shadow: 0 6px 25px rgba(245, 158, 11, 0.4);
+            transform: translateY(-2px);
+        }
+
+        .voice-control {
+            margin: 30px 0;
+            padding: 30px;
+            background: linear-gradient(135deg, #fef3c7 0%, #fde68a 100%);
+            border-radius: 16px;
+            border-left: 5px solid var(--warning);
+        }
+
+        .voice-control h3 {
+            color: #92400e;
+            margin-bottom: 20px;
+            font-size: 1.3em;
+            font-weight: 700;
             display: flex;
+            align-items: center;
             gap: 10px;
-            margin-top: 15px;
-            flex-wrap: wrap;
         }
 
-        .player-btn {
-            flex: 1;
-            min-width: 100px;
-            padding: 12px 20px;
-            border: none;
-            border-radius: 8px;
-            font-weight: 600;
+        .voice-control select {
+            width: 100%;
+            padding: 14px 18px;
+            border: 2px solid #f59e0b;
+            border-radius: 12px;
+            font-size: 1em;
+            font-weight: 500;
+            background: white;
             cursor: pointer;
             transition: all 0.3s ease;
+            appearance: none;
+            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='%23f59e0b' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'%3E%3C/polyline%3E%3C/svg%3E");
+            background-repeat: no-repeat;
+            background-position: right 12px center;
+            background-size: 20px;
+            padding-right: 45px;
         }
 
-        .player-btn.play {
-            background: #10b981;
-            color: white;
+        .voice-control select:hover {
+            border-color: #d97706;
+            box-shadow: 0 4px 15px rgba(245, 158, 11, 0.2);
         }
 
-        .player-btn.pause {
-            background: #f59e0b;
-            color: white;
+        .voice-control select:focus {
+            outline: none;
+            border-color: #d97706;
+            box-shadow: 0 0 0 4px rgba(245, 158, 11, 0.1);
         }
 
-        .player-btn.stop {
-            background: #ef4444;
-            color: white;
+        .download-all-section {
+            margin-top: 30px;
+            padding: 30px;
+            background: linear-gradient(135deg, #ede9fe 0%, #ddd6fe 100%);
+            border-radius: 16px;
+            text-align: center;
         }
 
-        .player-btn:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 4px 12px rgba(0,0,0,0.2);
+        .audio-player {
+            margin-top: 15px;
+            padding: 15px;
+            background: linear-gradient(135deg, #f0f9ff 0%, #e0f2fe 100%);
+            border-radius: 12px;
+            display: none;
         }
 
-        .progress-info {
+        .audio-player.active {
+            display: block;
+            animation: slideIn 0.3s ease;
+        }
+
+        .audio-player audio {
+            width: 100%;
+            height: 45px;
+        }
+
+        .inline-transcript {
             margin-top: 15px;
             padding: 15px;
             background: white;
-            border-radius: 8px;
-            border: 1px solid #e5e7eb;
+            border-radius: 10px;
+            max-height: 200px;
+            overflow-y: auto;
+            line-height: 1.8;
+            font-size: 0.95em;
+            color: #374151;
+            box-shadow: inset 0 2px 8px rgba(0, 0, 0, 0.05);
+            display: none;
         }
 
-        .progress-bar {
-            height: 8px;
-            background: #e5e7eb;
+        .inline-transcript.active {
+            display: block;
+        }
+
+        .inline-transcript .word {
+            display: inline;
+            padding: 2px 1px;
+            transition: all 0.2s ease;
+        }
+
+        .inline-transcript .word.current {
+            background: linear-gradient(135deg, #fbbf24 0%, #f59e0b 100%);
+            color: #78350f;
+            padding: 3px 6px;
             border-radius: 4px;
-            overflow: hidden;
-            margin: 10px 0;
+            font-weight: 600;
+            box-shadow: 0 2px 8px rgba(251, 191, 36, 0.3);
         }
 
-        .progress-fill {
+        .inline-transcript .word.passed {
+            color: #9ca3af;
+        }
+
+        .transcript-progress {
+            height: 3px;
+            background: #e5e7eb;
+            border-radius: 3px;
+            overflow: hidden;
+            margin-top: 10px;
+        }
+
+        .transcript-progress-bar {
             height: 100%;
-            background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
+            background: linear-gradient(90deg, #10b981 0%, #059669 100%);
+            width: 0%;
             transition: width 0.3s ease;
         }
 
-        .current-text {
-            margin-top: 15px;
-            padding: 15px;
-            background: #fef3c7;
-            border-radius: 8px;
-            border-left: 4px solid #f59e0b;
-            font-style: italic;
-            color: #92400e;
-            max-height: 150px;
-            overflow-y: auto;
+        .modal {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.7);
+            backdrop-filter: blur(5px);
+            z-index: 1000;
+            align-items: center;
+            justify-content: center;
+            animation: fadeIn 0.3s ease;
         }
 
-        .loading {
+        @keyframes fadeIn {
+            from {
+                opacity: 0;
+            }
+            to {
+                opacity: 1;
+            }
+        }
+
+        .modal.active {
+            display: flex;
+        }
+
+        .modal-content {
+            background: white;
+            padding: 40px;
+            border-radius: 20px;
+            max-width: 550px;
+            width: 90%;
+            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
+            animation: modalSlide 0.3s ease;
+        }
+
+        @keyframes modalSlide {
+            from {
+                opacity: 0;
+                transform: translateY(-50px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .modal-header h2 {
+            color: var(--dark);
+            font-size: 1.8em;
+            margin-bottom: 10px;
+            font-weight: 700;
+        }
+
+        .modal-header p {
+            color: #6b7280;
+            margin-bottom: 25px;
+        }
+
+        .modal-body input {
+            width: 100%;
+            padding: 14px 18px;
+            border: 2px solid var(--border);
+            border-radius: 12px;
+            font-size: 1em;
+            transition: all 0.3s ease;
+        }
+
+        .modal-body input:focus {
+            outline: none;
+            border-color: var(--primary);
+            box-shadow: 0 0 0 4px rgba(99, 102, 241, 0.1);
+        }
+
+        .modal-footer {
+            display: flex;
+            gap: 12px;
+            margin-top: 25px;
+        }
+
+        .modal-footer .btn {
+            flex: 1;
+        }
+
+        .loading-overlay {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(255, 255, 255, 0.95);
+            backdrop-filter: blur(10px);
+            z-index: 999;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .loading-overlay.active {
+            display: flex;
+        }
+
+        .loading-content {
             text-align: center;
-            margin: 30px 0;
         }
 
         .spinner {
-            width: 50px;
-            height: 50px;
-            margin: 0 auto 15px;
-            border: 5px solid #f3f3f3;
-            border-top: 5px solid #667eea;
+            width: 70px;
+            height: 70px;
+            margin: 0 auto 25px;
+            border: 6px solid rgba(99, 102, 241, 0.1);
+            border-top: 6px solid var(--primary);
             border-radius: 50%;
             animation: spin 1s linear infinite;
         }
@@ -410,186 +1206,276 @@ async def root():
             100% { transform: rotate(360deg); }
         }
 
-        .voice-selector {
-            margin: 15px 0;
-            padding: 15px;
-            background: white;
-            border-radius: 8px;
-            border: 1px solid #e5e7eb;
+        .loading-text {
+            font-size: 1.3em;
+            color: var(--dark);
+            font-weight: 600;
+            margin-bottom: 10px;
         }
 
-        .voice-selector select {
-            width: 100%;
-            padding: 10px;
-            border: 2px solid #667eea;
-            border-radius: 8px;
+        .loading-subtext {
+            color: #6b7280;
             font-size: 1em;
-            background: white;
-            cursor: pointer;
         }
 
-        .speed-control {
+        .toast-container {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            z-index: 1001;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+
+        .toast {
+            padding: 16px 24px;
+            border-radius: 12px;
+            box-shadow: 0 10px 40px rgba(0, 0, 0, 0.15);
             display: flex;
             align-items: center;
-            gap: 10px;
-            margin-top: 10px;
+            gap: 12px;
+            min-width: 300px;
+            max-width: 500px;
+            animation: toastSlide 0.3s ease;
+            font-weight: 500;
         }
 
-        .speed-control input {
-            flex: 1;
+        @keyframes toastSlide {
+            from {
+                opacity: 0;
+                transform: translateX(100%);
+            }
+            to {
+                opacity: 1;
+                transform: translateX(0);
+            }
+        }
+
+        .toast-success {
+            background: linear-gradient(135deg, #10b981 0%, #059669 100%);
+            color: white;
+        }
+
+        .toast-error {
+            background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%);
+            color: white;
+        }
+
+        .toast-info {
+            background: linear-gradient(135deg, #3b82f6 0%, #2563eb 100%);
+            color: white;
+        }
+
+        .toast-warning {
+            background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%);
+            color: white;
+        }
+
+        .hidden {
+            display: none !important;
+        }
+
+        @media (max-width: 768px) {
+            header h1 {
+                font-size: 2em;
+            }
+            
+            .pages-grid {
+                grid-template-columns: 1fr;
+            }
+
+            .main-content {
+                padding: 20px;
+            }
+
+            .modal-content {
+                padding: 25px;
+            }
+        }
+
+        .processing-indicator {
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--warning);
+            animation: pulse 1.5s ease-in-out infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% {
+                opacity: 1;
+                transform: scale(1);
+            }
+            50% {
+                opacity: 0.5;
+                transform: scale(1.2);
+            }
         }
     </style>
 </head>
 <body>
     <div class="container">
-        <header>
-            <h1>📄 PDF to Speech</h1>
-            <p>Upload PDF - Browser Reads It Aloud</p>
-            <span class="browser-badge">🎤 Browser Native Speech</span>
-        </header>
+        <div class="glass">
+            <header>
+                <h1>🎙️ PDF to Speech Pro</h1>
+                <p>Transform Your Documents into Natural AI-Powered Speech</p>
+                <div class="badge-container">
+                    <span class="badge badge-primary">🤖 AI Enhanced</span>
+                    <span class="badge badge-success">🎵 Premium Voices</span>
+                    <span class="badge badge-primary">⚡ Real-time Processing</span>
+                </div>
+            </header>
 
-        <div class="upload-section">
-            <div class="upload-box" id="uploadBox">
-                <svg class="upload-icon" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
-                </svg>
-                <p>Drag & drop PDF or click to browse</p>
-                <input type="file" id="fileInput" accept=".pdf" hidden>
-            </div>
-            <div class="file-info" id="fileInfo" style="display: none;">
-                <p><strong>File:</strong> <span id="fileName"></span></p>
-                <p><strong>Pages:</strong> <span id="pageCount"></span></p>
-                <p><strong>Lines:</strong> <span id="lineCount"></span></p>
-            </div>
-        </div>
+            <div class="main-content">
+                <!-- Upload Section -->
+                <div class="upload-section">
+                    <div class="upload-box" id="uploadBox">
+                        <div class="upload-icon">📄</div>
+                        <h3>Drop your PDF here or click to browse</h3>
+                        <p>Maximum 100 pages • AI-enhanced narration • Multiple voice options</p>
+                        <input type="file" id="fileInput" accept=".pdf" hidden>
+                    </div>
+                </div>
 
-        <div class="error-message" id="errorMessage" style="display: none;"></div>
-        <div class="success-message" id="successMessage" style="display: none;"></div>
+                <!-- Voice Selection -->
+                <div class="voice-control hidden" id="voiceControl">
+                    <h3>🎤 Select Your Voice</h3>
+                    <select id="voiceSelect">
+                        <option value="">Loading voices...</option>
+                    </select>
+                </div>
 
-        <div class="controls" id="controls" style="display: none;">
-            <button class="btn" id="startBtn">
-                <span>▶️ Start Reading</span>
-            </button>
-        </div>
+                <!-- Processing Status -->
+                <div class="processing-status" id="processingStatus">
+                    <div class="status-header">
+                        <h3>📊 Processing Status</h3>
+                        <div id="overallStatus">
+                            <span class="page-status-badge status-pending">Preparing...</span>
+                        </div>
+                    </div>
+                    
+                    <div class="overall-progress">
+                        <div class="progress-bar-container">
+                            <div class="progress-bar-fill" id="overallProgressFill" style="width: 0%"></div>
+                        </div>
+                        <div class="progress-text">
+                            <span id="progressText">0 of 0 pages processed</span>
+                            <span id="progressPercent">0%</span>
+                        </div>
+                    </div>
 
-        <div class="player" id="player" style="display: none;">
-            <h3>🎧 Now Playing</h3>
-            
-            <div class="voice-selector">
-                <label><strong>Voice:</strong></label>
-                <select id="voiceSelect"></select>
-                <div class="speed-control">
-                    <label><strong>Speed:</strong></label>
-                    <input type="range" id="speedControl" min="0.5" max="2" step="0.1" value="1">
-                    <span id="speedValue">1.0x</span>
+                    <div class="pages-grid" id="pagesGrid"></div>
+                </div>
+
+                <!-- Download All Section -->
+                <div class="download-all-section hidden" id="downloadAllSection">
+                    <h3 style="margin-bottom: 15px; color: var(--primary-dark); font-size: 1.3em;">🎧 Ready to Download</h3>
+                    <p style="color: #6b7280; margin-bottom: 20px;">All pages have been processed and are ready for download</p>
+                    <button class="btn btn-primary" id="downloadAllBtn" style="font-size: 1.1em; padding: 14px 30px;">
+                        📥 Download Complete Document Audio
+                    </button>
                 </div>
             </div>
-
-            <div class="progress-info">
-                <div><strong>Progress:</strong> <span id="progressText">0 / 0</span></div>
-                <div class="progress-bar">
-                    <div class="progress-fill" id="progressFill"></div>
-                </div>
-                <div><strong>Page:</strong> <span id="currentPage">-</span></div>
-            </div>
-
-            <div class="current-text" id="currentText">Ready to start...</div>
-
-            <div class="player-controls">
-                <button class="player-btn play" id="playBtn">▶️ Play</button>
-                <button class="player-btn pause" id="pauseBtn">⏸️ Pause</button>
-                <button class="player-btn stop" id="stopBtn">⏹️ Stop</button>
-            </div>
-        </div>
-
-        <div class="loading" id="loading" style="display: none;">
-            <div class="spinner"></div>
-            <p id="loadingText">Processing...</p>
         </div>
     </div>
 
+    <!-- Loading Overlay -->
+    <div class="loading-overlay" id="loadingOverlay">
+        <div class="loading-content">
+            <div class="spinner"></div>
+            <div class="loading-text" id="loadingText">Processing...</div>
+            <div class="loading-subtext" id="loadingSubtext">Please wait while we process your document</div>
+        </div>
+    </div>
+
+    <!-- Download Modal -->
+    <div class="modal" id="downloadModal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2>💾 Save Audio File</h2>
+                <p>Choose a name for your audio file</p>
+            </div>
+            <div class="modal-body">
+                <input type="text" id="downloadFilename" placeholder="Enter filename (e.g., my-document)">
+                <p style="margin-top: 12px; color: #6b7280; font-size: 0.9em;">
+                    📝 The file will be saved as <strong>.mp3</strong> format automatically
+                </p>
+            </div>
+            <div class="modal-footer">
+                <button class="btn" style="background: #6b7280; color: white;" id="cancelDownload">
+                    Cancel
+                </button>
+                <button class="btn btn-download" id="confirmDownload">
+                    💾 Download
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Toast Container -->
+    <div class="toast-container" id="toastContainer"></div>
+
     <script>
         const API_URL = window.location.origin;
-
-        let pdfLines = [];
-        let currentIndex = 0;
-        let isPaused = false;
-        let isSpeaking = false;
-        let speechSynthesis = window.speechSynthesis;
-        let currentUtterance = null;
-        let availableVoices = [];
+        let pdfData = null;
         let selectedVoice = null;
-        let speechSpeed = 1.0;
+        let currentDownloadData = null;
+        let processedPages = 0;
+        let totalPages = 0;
+        let accessiblePages = 0;
+        let lockedPages = 0;
 
         // DOM Elements
         const uploadBox = document.getElementById('uploadBox');
         const fileInput = document.getElementById('fileInput');
-        const fileInfo = document.getElementById('fileInfo');
-        const fileName = document.getElementById('fileName');
-        const pageCount = document.getElementById('pageCount');
-        const lineCount = document.getElementById('lineCount');
-        const controls = document.getElementById('controls');
-        const startBtn = document.getElementById('startBtn');
-        const player = document.getElementById('player');
-        const playBtn = document.getElementById('playBtn');
-        const pauseBtn = document.getElementById('pauseBtn');
-        const stopBtn = document.getElementById('stopBtn');
-        const currentText = document.getElementById('currentText');
-        const progressText = document.getElementById('progressText');
-        const progressFill = document.getElementById('progressFill');
-        const currentPage = document.getElementById('currentPage');
-        const loading = document.getElementById('loading');
-        const loadingText = document.getElementById('loadingText');
-        const errorMessage = document.getElementById('errorMessage');
-        const successMessage = document.getElementById('successMessage');
+        const voiceControl = document.getElementById('voiceControl');
         const voiceSelect = document.getElementById('voiceSelect');
-        const speedControl = document.getElementById('speedControl');
-        const speedValue = document.getElementById('speedValue');
+        const processingStatus = document.getElementById('processingStatus');
+        const pagesGrid = document.getElementById('pagesGrid');
+        const overallStatus = document.getElementById('overallStatus');
+        const overallProgressFill = document.getElementById('overallProgressFill');
+        const progressText = document.getElementById('progressText');
+        const progressPercent = document.getElementById('progressPercent');
+        const downloadAllSection = document.getElementById('downloadAllSection');
+        const downloadAllBtn = document.getElementById('downloadAllBtn');
+        const loadingOverlay = document.getElementById('loadingOverlay');
+        const loadingText = document.getElementById('loadingText');
+        const loadingSubtext = document.getElementById('loadingSubtext');
+        const downloadModal = document.getElementById('downloadModal');
+        const downloadFilename = document.getElementById('downloadFilename');
+        const cancelDownload = document.getElementById('cancelDownload');
+        const confirmDownload = document.getElementById('confirmDownload');
+        const toastContainer = document.getElementById('toastContainer');
 
         // Load voices
-        function loadVoices() {
-            availableVoices = speechSynthesis.getVoices();
-            voiceSelect.innerHTML = '';
-            
-            // Filter English voices
-            const englishVoices = availableVoices.filter(voice => voice.lang.startsWith('en'));
-            
-            if (englishVoices.length === 0) {
-                englishVoices.push(...availableVoices.slice(0, 5)); // Fallback to first 5 voices
+        async function loadVoices() {
+            try {
+                const response = await fetch(`${API_URL}/api/voices`);
+                const data = await response.json();
+                
+                voiceSelect.innerHTML = '';
+                data.voices.forEach((voice, index) => {
+                    const option = document.createElement('option');
+                    option.value = voice.id;
+                    option.textContent = voice.name;
+                    if (index === 0) {
+                        option.selected = true;
+                        selectedVoice = voice.id;
+                    }
+                    voiceSelect.appendChild(option);
+                });
+            } catch (error) {
+                console.error('Error loading voices:', error);
+                showToast('Failed to load voices', 'error');
             }
-            
-            englishVoices.forEach((voice, index) => {
-                const option = document.createElement('option');
-                option.value = index;
-                option.textContent = `${voice.name} (${voice.lang})`;
-                if (voice.default) {
-                    option.selected = true;
-                    selectedVoice = voice;
-                }
-                voiceSelect.appendChild(option);
-            });
-            
-            if (!selectedVoice && englishVoices.length > 0) {
-                selectedVoice = englishVoices[0];
-            }
-        }
-
-        // Initialize voices
-        loadVoices();
-        if (speechSynthesis.onvoiceschanged !== undefined) {
-            speechSynthesis.onvoiceschanged = loadVoices;
         }
 
         // Voice selection
         voiceSelect.addEventListener('change', (e) => {
-            const voices = speechSynthesis.getVoices().filter(v => v.lang.startsWith('en'));
-            selectedVoice = voices[e.target.value] || voices[0];
-        });
-
-        // Speed control
-        speedControl.addEventListener('input', (e) => {
-            speechSpeed = parseFloat(e.target.value);
-            speedValue.textContent = speechSpeed.toFixed(1) + 'x';
+            selectedVoice = e.target.value;
+            showToast('Voice changed successfully!', 'success');
         });
 
         // Upload handling
@@ -609,11 +1495,9 @@ async def root():
             e.preventDefault();
             uploadBox.classList.remove('dragover');
             const files = e.dataTransfer.files;
-            if (files.length > 0 && files[0].type === 'application/pdf') {
+            if (files.length > 0) {
                 fileInput.files = files;
                 handleFileSelect({ target: fileInput });
-            } else {
-                showError('Please drop a valid PDF file');
             }
         });
 
@@ -622,12 +1506,11 @@ async def root():
             if (!file) return;
             
             if (file.type !== 'application/pdf') {
-                showError('Please select a PDF file');
+                showToast('Please select a valid PDF file', 'error');
                 return;
             }
-            
-            hideMessages();
-            showLoading('Parsing PDF...');
+
+            showLoading('Parsing PDF with AI enhancement...', 'This may take a moment for large documents');
             
             try {
                 const formData = new FormData();
@@ -640,125 +1523,575 @@ async def root():
                 
                 const data = await response.json();
                 
-                if (!response.ok) {
-                    throw new Error(data.detail || 'Failed to parse PDF');
+                if (data.success && data.pages.length > 0) {
+                    pdfData = data;
+                    totalPages = data.page_count;
+                    accessiblePages = data.accessible_pages;
+                    lockedPages = data.locked_pages || 0;
+                    processedPages = 0;
+                    
+                    // Show UI sections
+                    voiceControl.classList.remove('hidden');
+                    processingStatus.classList.add('active');
+                    
+                    // Initialize pages grid
+                    initializePagesGrid(data.pages);
+                    
+                    hideLoading();
+                    
+                    // Show info about page limits
+                    if (data.has_limit) {
+                        showToast(`📄 ${accessiblePages} pages ready. ${lockedPages} pages marked as incomplete - click to process!`, 'info');
+                    } else {
+                        showToast(`PDF loaded! ${accessiblePages} pages ready to process.`, 'success');
+                    }
+                    
+                    updateOverallProgress();
+                } else {
+                    hideLoading();
+                    showToast('No content could be extracted from PDF', 'error');
                 }
-                
-                pdfLines = data.lines;
-                
-                fileName.textContent = file.name;
-                pageCount.textContent = data.page_count;
-                lineCount.textContent = data.line_count;
-                fileInfo.style.display = 'block';
-                controls.style.display = 'block';
-                
-                hideLoading();
-                showSuccess(`PDF loaded! ${data.line_count} lines ready to read.`);
                 
             } catch (error) {
                 hideLoading();
-                showError(error.message);
+                console.error('Parse error:', error);
+                showToast('Failed to parse PDF. Please try again.', 'error');
             }
         }
 
-        startBtn.addEventListener('click', () => {
-            if (pdfLines.length === 0) return;
+        function initializePagesGrid(pages) {
+            pagesGrid.innerHTML = '';
             
-            controls.style.display = 'none';
-            player.style.display = 'block';
-            currentIndex = 0;
-            speakNext();
-        });
+            pages.forEach((page, index) => {
+                const pageCard = createPageCard(page, index);
+                pagesGrid.appendChild(pageCard);
+                
+                // Animate cards in sequence
+                setTimeout(() => {
+                    pageCard.style.animation = 'slideIn 0.5s ease forwards';
+                }, index * 50);
+            });
+        }
 
-        function speakNext() {
-            if (currentIndex >= pdfLines.length) {
-                currentText.textContent = '✅ Finished reading all text!';
-                isSpeaking = false;
+        function createPageCard(page, index) {
+            const card = document.createElement('div');
+            card.className = 'page-item';
+            if (page.is_locked) {
+                card.classList.add('locked');
+            }
+            card.id = `page-${page.page}`;
+            card.style.opacity = '0';
+            
+            const previewText = page.is_locked 
+                ? (page.text.substring(0, 150) + (page.text.length > 150 ? '...' : ''))
+                : (page.text.substring(0, 150) + (page.text.length > 150 ? '...' : ''));
+            const wordCount = page.word_count || 0;
+            
+            const statusBadge = page.is_locked 
+                ? '<span class="page-status-badge status-incomplete" id="status-' + page.page + '">⏸️ Incomplete</span>'
+                : '<span class="page-status-badge status-pending" id="status-' + page.page + '">⏳ Pending</span>';
+            
+            const actionButtons = page.is_locked
+                ? `<button class="btn btn-warning" id="process-${page.page}" onclick="processLockedPage(${page.page})" style="background: linear-gradient(135deg, #fb923c 0%, #f97316 100%); color: white;">
+                        🔄 Process Page
+                   </button>`
+                : `<button class="btn btn-success" id="play-${page.page}" onclick="playPage(${page.page})">
+                        ▶️ Play
+                   </button>
+                   <button class="btn btn-download" id="download-${page.page}" onclick="downloadPage(${page.page})">
+                        💾 Download
+                   </button>`;
+            
+            card.innerHTML = `
+                <div class="page-header">
+                    <div class="page-number">
+                        📄 Page ${page.page}
+                    </div>
+                    ${statusBadge}
+                </div>
+                <div class="page-preview">${previewText}</div>
+                <div class="page-meta">
+                    <div class="meta-item">
+                        <span>📝</span>
+                        <span>${wordCount} words${page.is_locked ? ' (locked)' : ''}</span>
+                    </div>
+                    <div class="meta-item">
+                        <span>⏱️</span>
+                        <span id="time-${page.page}">--</span>
+                    </div>
+                </div>
+                <div class="page-actions">
+                    ${actionButtons}
+                </div>
+                <div class="audio-player" id="player-${page.page}">
+                    <audio controls id="audio-${page.page}"></audio>
+                    <div class="inline-transcript" id="transcript-${page.page}"></div>
+                    <div class="transcript-progress">
+                        <div class="transcript-progress-bar" id="transcript-progress-${page.page}"></div>
+                    </div>
+                </div>
+            `;
+            
+            return card;
+        }
+
+        async function processLockedPage(pageNum) {
+            const page = pdfData.pages.find(p => p.page === pageNum);
+            if (!page) return;
+
+            const card = document.getElementById(`page-${pageNum}`);
+            const statusBadge = document.getElementById(`status-${pageNum}`);
+            const processBtn = document.getElementById(`process-${pageNum}`);
+            
+            // Update to processing
+            card.classList.remove('locked');
+            card.classList.add('processing');
+            statusBadge.className = 'page-status-badge status-processing';
+            statusBadge.innerHTML = '<span class="processing-indicator"></span> Processing...';
+            processBtn.disabled = true;
+            processBtn.textContent = '⏳ Processing...';
+            
+            showToast(`Processing page ${pageNum} in background...`, 'info');
+            
+            // Simulate processing (in real app, you'd call backend to process)
+            setTimeout(() => {
+                // Use full_text for unlocked page
+                page.text = page.full_text;
+                page.is_locked = false;
+                page.is_accessible = true;
+                
+                // Update card to ready state
+                card.classList.remove('processing');
+                card.classList.add('completed');
+                statusBadge.className = 'page-status-badge status-pending';
+                statusBadge.innerHTML = '⏳ Ready';
+                
+                // Update word count display
+                const wordCountMeta = card.querySelector('.page-meta .meta-item span:nth-child(2)');
+                if (wordCountMeta) {
+                    wordCountMeta.textContent = page.word_count + ' words';
+                }
+                
+                // Update preview text
+                const previewDiv = card.querySelector('.page-preview');
+                if (previewDiv) {
+                    const previewText = page.full_text.substring(0, 150) + (page.full_text.length > 150 ? '...' : '');
+                    previewDiv.textContent = previewText;
+                }
+                
+                // Replace button with play/download
+                const actionsDiv = card.querySelector('.page-actions');
+                actionsDiv.innerHTML = `
+                    <button class="btn btn-success" id="play-${pageNum}" onclick="playPage(${pageNum})">
+                        ▶️ Play
+                    </button>
+                    <button class="btn btn-download" id="download-${pageNum}" onclick="downloadPage(${pageNum})">
+                        💾 Download
+                    </button>
+                `;
+                
+                showToast(`Page ${pageNum} is now ready! ${page.word_count} words available.`, 'success');
+                
+                // Update accessible count
+                accessiblePages++;
+                updateOverallProgress();
+            }, 2000); // 2 second simulated processing
+        }
+
+        async function playPage(pageNum) {
+            if (!selectedVoice) {
+                showToast('Please select a voice first', 'error');
                 return;
             }
+
+            const page = pdfData.pages.find(p => p.page === pageNum);
+            if (!page || page.is_locked) {
+                showToast('This page is incomplete. Click "Process Page" first!', 'warning');
+                return;
+            }
+
+            const card = document.getElementById(`page-${pageNum}`);
+            const statusBadge = document.getElementById(`status-${pageNum}`);
+            const audioPlayer = document.getElementById(`player-${pageNum}`);
+            const audioElement = document.getElementById(`audio-${pageNum}`);
+            const transcriptDiv = document.getElementById(`transcript-${pageNum}`);
+            const transcriptProgress = document.getElementById(`transcript-progress-${pageNum}`);
+            const playBtn = document.getElementById(`play-${pageNum}`);
+            const timeDisplay = document.getElementById(`time-${pageNum}`);
             
-            const line = pdfLines[currentIndex];
+            // Scroll page card into view smoothly
+            card.scrollIntoView({ behavior: 'smooth', block: 'center' });
             
-            // Update UI
-            currentText.textContent = line.text;
-            currentPage.textContent = `Page ${line.page}`;
-            progressText.textContent = `${currentIndex + 1} / ${pdfLines.length}`;
-            const progress = ((currentIndex + 1) / pdfLines.length) * 100;
-            progressFill.style.width = progress + '%';
+            // Update status to processing
+            card.classList.add('processing');
+            statusBadge.className = 'page-status-badge status-processing';
+            statusBadge.innerHTML = '<span class="processing-indicator"></span> Generating...';
+            playBtn.disabled = true;
             
-            // Create speech
-            currentUtterance = new SpeechSynthesisUtterance(line.text);
-            currentUtterance.voice = selectedVoice;
-            currentUtterance.rate = speechSpeed;
+            const startTime = Date.now();
             
-            currentUtterance.onend = () => {
-                if (!isPaused) {
-                    currentIndex++;
-                    speakNext();
+            try {
+                const response = await fetch(`${API_URL}/api/generate-page-audio?page=${pageNum}&voice=${selectedVoice}&text=${encodeURIComponent(page.text)}`, {
+                    method: 'POST'
+                });
+                
+                if (!response.ok) {
+                    throw new Error('Audio generation failed');
+                }
+                
+                const blob = await response.blob();
+                const audioUrl = URL.createObjectURL(blob);
+                
+                audioElement.src = audioUrl;
+                audioPlayer.classList.add('active');
+                
+                // Setup inline transcript
+                setupInlineTranscript(page.text, audioElement, transcriptDiv, transcriptProgress, pageNum);
+                
+                // Auto-play the audio
+                await audioElement.play();
+                
+                // Update status to completed
+                card.classList.remove('processing');
+                card.classList.add('completed');
+                statusBadge.className = 'page-status-badge status-completed';
+                statusBadge.innerHTML = '✅ Playing';
+                
+                const processingTime = ((Date.now() - startTime) / 1000).toFixed(1);
+                timeDisplay.textContent = `${processingTime}s`;
+                
+                playBtn.disabled = false;
+                
+                // Update progress
+                if (!card.dataset.processed) {
+                    card.dataset.processed = 'true';
+                    processedPages++;
+                    updateOverallProgress();
+                }
+                
+                // Update status when audio ends
+                audioElement.onended = () => {
+                    statusBadge.innerHTML = '✅ Ready';
+                    showToast(`Page ${pageNum} playback completed`, 'success');
+                };
+                
+                showToast(`Playing page ${pageNum}`, 'success');
+                
+            } catch (error) {
+                console.error('Play error:', error);
+                card.classList.remove('processing');
+                card.classList.add('error');
+                statusBadge.className = 'page-status-badge status-error';
+                statusBadge.innerHTML = '❌ Failed';
+                playBtn.disabled = false;
+                showToast(`Failed to generate audio for page ${pageNum}`, 'error');
+            }
+        }
+
+        function setupInlineTranscript(text, audioElement, transcriptDiv, progressBar, pageNum) {
+            // Split text into words
+            const words = text.split(/\s+/);
+            let currentWordIndex = 0;
+            let transcriptInterval = null;
+            
+            // Create word spans
+            transcriptDiv.innerHTML = words.map((word, idx) => 
+                `<span class="word" id="word-${pageNum}-${idx}">${word}</span>`
+            ).join(' ');
+            
+            transcriptDiv.classList.add('active');
+            
+            // Calculate words per second (average speaking rate)
+            const wordsPerSecond = 2.5;
+            const msPerWord = 1000 / wordsPerSecond;
+            
+            // Handle play event
+            const handlePlay = () => {
+                currentWordIndex = 0;
+                
+                // Clear existing interval
+                if (transcriptInterval) {
+                    clearInterval(transcriptInterval);
+                }
+                
+                // Start highlighting words
+                transcriptInterval = setInterval(() => {
+                    if (currentWordIndex < words.length && !audioElement.paused) {
+                        // Mark previous word as passed
+                        if (currentWordIndex > 0) {
+                            const prevWord = document.getElementById(`word-${pageNum}-${currentWordIndex - 1}`);
+                            if (prevWord) {
+                                prevWord.classList.remove('current');
+                                prevWord.classList.add('passed');
+                            }
+                        }
+                        
+                        // Highlight current word
+                        const currentWord = document.getElementById(`word-${pageNum}-${currentWordIndex}`);
+                        if (currentWord) {
+                            currentWord.classList.add('current');
+                            
+                            // Auto-scroll transcript to current word
+                            const transcriptRect = transcriptDiv.getBoundingClientRect();
+                            const wordRect = currentWord.getBoundingClientRect();
+                            
+                            if (wordRect.top < transcriptRect.top || wordRect.bottom > transcriptRect.bottom) {
+                                currentWord.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                            }
+                        }
+                        
+                        // Update progress bar
+                        const progress = ((currentWordIndex + 1) / words.length) * 100;
+                        progressBar.style.width = progress + '%';
+                        
+                        currentWordIndex++;
+                    }
+                }, msPerWord);
+            };
+            
+            // Handle pause event
+            const handlePause = () => {
+                if (transcriptInterval) {
+                    clearInterval(transcriptInterval);
                 }
             };
             
-            currentUtterance.onerror = (e) => {
-                console.error('Speech error:', e);
-                currentIndex++;
-                speakNext();
+            // Handle ended event
+            const handleEnded = () => {
+                if (transcriptInterval) {
+                    clearInterval(transcriptInterval);
+                }
+                
+                // Mark all words as passed
+                document.querySelectorAll(`#transcript-${pageNum} .word`).forEach(word => {
+                    word.classList.remove('current');
+                    word.classList.add('passed');
+                });
+                
+                progressBar.style.width = '100%';
             };
             
-            speechSynthesis.speak(currentUtterance);
-            isSpeaking = true;
+            // Handle seeking
+            const handleSeeked = () => {
+                // Reset all words
+                document.querySelectorAll(`#transcript-${pageNum} .word`).forEach(word => {
+                    word.classList.remove('current', 'passed');
+                });
+                
+                // Estimate current word based on time
+                const currentTime = audioElement.currentTime;
+                const duration = audioElement.duration;
+                if (duration > 0) {
+                    const estimatedWordIndex = Math.floor((currentTime / duration) * words.length);
+                    currentWordIndex = estimatedWordIndex;
+                    
+                    // Mark words before current as passed
+                    for (let i = 0; i < currentWordIndex; i++) {
+                        const word = document.getElementById(`word-${pageNum}-${i}`);
+                        if (word) {
+                            word.classList.add('passed');
+                        }
+                    }
+                    
+                    progressBar.style.width = ((currentWordIndex / words.length) * 100) + '%';
+                }
+            };
+            
+            // Add event listeners
+            audioElement.addEventListener('play', handlePlay);
+            audioElement.addEventListener('pause', handlePause);
+            audioElement.addEventListener('ended', handleEnded);
+            audioElement.addEventListener('seeked', handleSeeked);
         }
 
-        playBtn.addEventListener('click', () => {
-            if (isPaused) {
-                isPaused = false;
-                speechSynthesis.resume();
-            } else if (!isSpeaking) {
-                speakNext();
+        function downloadPage(pageNum) {
+            const page = pdfData.pages.find(p => p.page === pageNum);
+            if (!page) return;
+            
+            currentDownloadData = { 
+                pageNum, 
+                text: page.text,
+                type: 'single'
+            };
+            
+            downloadFilename.value = `page_${pageNum}_${Date.now()}`;
+            downloadModal.classList.add('active');
+            downloadFilename.focus();
+            downloadFilename.select();
+        }
+
+        cancelDownload.addEventListener('click', () => {
+            downloadModal.classList.remove('active');
+            currentDownloadData = null;
+        });
+
+        confirmDownload.addEventListener('click', async () => {
+            if (!currentDownloadData) return;
+            
+            const filename = downloadFilename.value.trim() || `page_${currentDownloadData.pageNum}`;
+            downloadModal.classList.remove('active');
+            
+            if (currentDownloadData.type === 'single') {
+                await downloadSinglePage(currentDownloadData.pageNum, currentDownloadData.text, filename);
+            } else {
+                await downloadFullDocument(filename);
             }
+            
+            currentDownloadData = null;
         });
 
-        pauseBtn.addEventListener('click', () => {
-            if (isSpeaking) {
-                isPaused = true;
-                speechSynthesis.pause();
+        async function downloadSinglePage(pageNum, text, filename) {
+            if (!selectedVoice) {
+                showToast('Please select a voice first', 'error');
+                return;
             }
+
+            showLoading('Generating audio file...', 'Preparing your download');
+            
+            try {
+                const response = await fetch(`${API_URL}/api/download-page-audio?page=${pageNum}&voice=${selectedVoice}&filename=${encodeURIComponent(filename)}&text=${encodeURIComponent(text)}`, {
+                    method: 'POST'
+                });
+                
+                if (!response.ok) {
+                    throw new Error('Download failed');
+                }
+                
+                const blob = await response.blob();
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `${filename}.mp3`;
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                URL.revokeObjectURL(url);
+                
+                hideLoading();
+                showToast(`Page ${pageNum} downloaded successfully!`, 'success');
+                
+            } catch (error) {
+                hideLoading();
+                console.error('Download error:', error);
+                showToast(`Failed to download page ${pageNum}`, 'error');
+            }
+        }
+
+        downloadAllBtn.addEventListener('click', () => {
+            if (!pdfData || !selectedVoice) {
+                showToast('Please select a voice first', 'error');
+                return;
+            }
+
+            currentDownloadData = {
+                type: 'full'
+            };
+            
+            downloadFilename.value = `full_document_${Date.now()}`;
+            downloadModal.classList.add('active');
+            downloadFilename.focus();
+            downloadFilename.select();
         });
 
-        stopBtn.addEventListener('click', () => {
-            speechSynthesis.cancel();
-            currentIndex = 0;
-            isPaused = false;
-            isSpeaking = false;
-            currentText.textContent = 'Stopped. Click Play to start from beginning.';
-            progressFill.style.width = '0%';
-            progressText.textContent = '0 / ' + pdfLines.length;
-        });
+        async function downloadFullDocument(filename) {
+            if (!pdfData || !selectedVoice) {
+                showToast('Please select a voice first', 'error');
+                return;
+            }
 
-        function showLoading(text) {
+            showLoading('Generating complete document audio...', 'This may take several minutes for large documents');
+            
+            try {
+                const response = await fetch(`${API_URL}/api/generate-full-document?voice=${selectedVoice}&filename=${encodeURIComponent(filename)}`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify(pdfData.pages)
+                });
+                
+                if (!response.ok) {
+                    throw new Error('Generation failed');
+                }
+                
+                const blob = await response.blob();
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `${filename}.mp3`;
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                URL.revokeObjectURL(url);
+                
+                hideLoading();
+                showToast('Full document downloaded successfully!', 'success');
+                
+            } catch (error) {
+                hideLoading();
+                console.error('Full document error:', error);
+                showToast('Failed to generate full document audio', 'error');
+            }
+        }
+
+        function updateOverallProgress() {
+            const percent = accessiblePages > 0 ? Math.round((processedPages / accessiblePages) * 100) : 0;
+            
+            overallProgressFill.style.width = percent + '%';
+            progressText.textContent = `${processedPages} of ${accessiblePages} pages processed`;
+            progressPercent.textContent = percent + '%';
+            
+            if (processedPages === 0) {
+                overallStatus.innerHTML = '<span class="page-status-badge status-pending">Ready to start</span>';
+            } else if (processedPages < accessiblePages) {
+                overallStatus.innerHTML = '<span class="page-status-badge status-processing"><span class="processing-indicator"></span> Processing...</span>';
+            } else {
+                overallStatus.innerHTML = '<span class="page-status-badge status-completed">✅ All pages completed</span>';
+                downloadAllSection.classList.remove('hidden');
+                downloadAllSection.style.animation = 'slideIn 0.5s ease';
+                
+                if (lockedPages > 0) {
+                    showToast(`🎉 All ${accessiblePages} pages complete! ${lockedPages} incomplete pages can be processed.`, 'success');
+                }
+            }
+        }
+
+        function showLoading(text, subtext = '') {
             loadingText.textContent = text;
-            loading.style.display = 'block';
+            loadingSubtext.textContent = subtext;
+            loadingOverlay.classList.add('active');
         }
 
         function hideLoading() {
-            loading.style.display = 'none';
+            loadingOverlay.classList.remove('active');
         }
 
-        function showError(message) {
-            errorMessage.textContent = '❌ ' + message;
-            errorMessage.style.display = 'block';
-            setTimeout(() => errorMessage.style.display = 'none', 5000);
+        function showToast(message, type = 'info') {
+            const toast = document.createElement('div');
+            toast.className = `toast toast-${type}`;
+            
+            const icons = {
+                success: '✅',
+                error: '❌',
+                warning: '⚠️',
+                info: 'ℹ️'
+            };
+            
+            toast.innerHTML = `
+                <span style="font-size: 1.3em;">${icons[type]}</span>
+                <span>${message}</span>
+            `;
+            
+            toastContainer.appendChild(toast);
+            
+            setTimeout(() => {
+                toast.style.animation = 'toastSlide 0.3s ease reverse';
+                setTimeout(() => toast.remove(), 300);
+            }, 5000);
         }
 
-        function showSuccess(message) {
-            successMessage.textContent = '✅ ' + message;
-            successMessage.style.display = 'block';
-            setTimeout(() => successMessage.style.display = 'none', 5000);
-        }
-
-        function hideMessages() {
-            errorMessage.style.display = 'none';
-            successMessage.style.display = 'none';
-        }
+        // Initialize
+        loadVoices();
     </script>
 </body>
 </html>
@@ -767,6 +2100,6 @@ async def root():
 
 if __name__ == "__main__":
     import uvicorn
-    logger.info("Starting PDF to Speech Converter with Browser TTS...")
-    logger.info("🎉 Using browser's native speech - no backend TTS needed!")
+    logger.info("Starting PDF to Speech Pro with Edge TTS + Groq AI...")
+    logger.info("🚀 Features: AI-enhanced narration, multiple voices, page-wise streaming, downloads")
     uvicorn.run(app, host="0.0.0.0", port=8000)
