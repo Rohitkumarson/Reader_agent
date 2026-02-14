@@ -265,7 +265,8 @@ async def process_pdf_page_smart(pdf_bytes: bytes, page_num: int) -> tuple:
             pdf_bytes,
             first_page=page_num + 1,
             last_page=page_num + 1,
-            dpi=200  # Good balance between quality and speed
+            dpi=200,  # Good balance between quality and speed
+            poppler_path="/usr/bin"   # 👈 ADD THIS ONLY IF NEEDED
         )
         
         if not images:
