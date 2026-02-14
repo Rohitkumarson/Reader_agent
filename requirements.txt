@@ -13,3 +13,4 @@ aiofiles
 pydantic
 httpx
 pycryptodome
+poppler-utils
